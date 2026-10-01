@@ -10,11 +10,10 @@ finish-args:
   - --share=ipc
   - --socket=wayland
   - --socket=fallback-x11
-  - --device=dri
   # redumper needs raw SCSI generic and sr devices to dump optical discs.
   # There is no portal for that.
   - --device=all
-  - --filesystem=home
+  - --filesystem=xdg-download
 modules:
   - name: redumper
     buildsystem: cmake-ninja
