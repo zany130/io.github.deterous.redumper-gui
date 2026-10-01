@@ -1,0 +1,415 @@
+name: Update Redumper GUI
+
+on:
+  schedule:
+    # Once a week: Sunday at 05:17 UTC
+    - cron: "17 5 * * 0"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: redumper-gui-updater
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    env:
+      MANIFEST: io.github.deterous.redumper-gui.yml
+      METAINFO: io.github.deterous.redumper-gui.metainfo.xml
+
+      GUI_REPO: Deterous/Redumper-GUI
+      GUI_GIT: https://github.com/Deterous/Redumper-GUI.git
+      REDUMPER_GIT: https://github.com/superg/redumper.git
+
+      # Pinned flatpak-builder-tools revision used to regenerate
+      # cargo-sources.json.
+      CARGO_GENERATOR_COMMIT: 74697c75b630d7330e77250fc13cb5ea688d9479
+
+    steps:
+      - name: Check out repository
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          git init .
+          git remote add origin \
+            "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+
+          git fetch --depth=1 origin "${GITHUB_REF_NAME}"
+          git checkout -B "${GITHUB_REF_NAME}" FETCH_HEAD
+
+      - name: Check upstream versions
+        id: versions
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          # GitHub's "latest release" endpoint ignores drafts and prereleases.
+          GUI_TAG="$(
+            gh api "repos/${GUI_REPO}/releases/latest" \
+              --jq '.tag_name'
+          )"
+
+          GUI_VERSION="${GUI_TAG#v}"
+
+          echo "Latest Redumper GUI release: ${GUI_TAG}"
+
+          # Fetch Deterous's build workflow from the exact release we're
+          # packaging. This is the source of truth for the supported
+          # redumper version.
+          gh api \
+            "repos/${GUI_REPO}/contents/.github/workflows/build.yml?ref=${GUI_TAG}" \
+            --jq '.content' |
+            base64 --decode \
+            > /tmp/redumper-gui-build.yml
+
+          REDUMPER_TAG="$(
+            awk -F ':' '
+              /^[[:space:]]*REDUMPER_VERSION:/ {
+                value=$2
+                gsub(/[[:space:]"'\'']/, "", value)
+                print value
+                exit
+              }
+            ' /tmp/redumper-gui-build.yml
+          )"
+
+          if [[ -z "${REDUMPER_TAG}" ]]; then
+            echo "Could not find REDUMPER_VERSION in upstream build.yml"
+            exit 1
+          fi
+
+          echo "Upstream-pinned redumper release: ${REDUMPER_TAG}"
+
+          resolve_tag_commit() {
+            repo="$1"
+            tag="$2"
+
+            # Prefer the peeled commit for annotated tags.
+            commit="$(
+              git ls-remote "${repo}" "refs/tags/${tag}^{}" |
+                awk 'NR == 1 { print $1 }'
+            )"
+
+            # Fall back to the tag itself for lightweight tags.
+            if [[ -z "${commit}" ]]; then
+              commit="$(
+                git ls-remote "${repo}" "refs/tags/${tag}" |
+                  awk 'NR == 1 { print $1 }'
+              )"
+            fi
+
+            if [[ -z "${commit}" ]]; then
+              echo "Could not resolve ${repo} tag ${tag}" >&2
+              return 1
+            fi
+
+            printf '%s\n' "${commit}"
+          }
+
+          GUI_COMMIT="$(
+            resolve_tag_commit "${GUI_GIT}" "${GUI_TAG}"
+          )"
+
+          REDUMPER_COMMIT="$(
+            resolve_tag_commit "${REDUMPER_GIT}" "${REDUMPER_TAG}"
+          )"
+
+          GUI_RELEASE_DATE="$(
+            gh api "repos/${GUI_REPO}/releases/tags/${GUI_TAG}" \
+              --jq '.published_at' |
+              cut -c1-10
+          )"
+
+          source_field() {
+            url="$1"
+            field="$2"
+
+            awk \
+              -v wanted_url="${url}" \
+              -v wanted_field="${field}:" '
+                $1 == "url:" && $2 == wanted_url {
+                  found=1
+                  next
+                }
+
+                found && $1 == wanted_field {
+                  print $2
+                  exit
+                }
+              ' "${MANIFEST}" |
+              tr -d "\"'"
+          }
+
+          CURRENT_GUI_TAG="$(
+            source_field "${GUI_GIT}" tag
+          )"
+
+          CURRENT_GUI_COMMIT="$(
+            source_field "${GUI_GIT}" commit
+          )"
+
+          CURRENT_REDUMPER_TAG="$(
+            source_field "${REDUMPER_GIT}" tag
+          )"
+
+          CURRENT_REDUMPER_COMMIT="$(
+            source_field "${REDUMPER_GIT}" commit
+          )"
+
+          CURRENT_REDUMPER_BUILD_VERSION="$(
+            grep -oE 'DREDUMPER_VERSION_BUILD=[^[:space:]]+' "${MANIFEST}" |
+              head -1 |
+              cut -d= -f2
+          )"
+
+          echo "Current GUI:      ${CURRENT_GUI_TAG} (${CURRENT_GUI_COMMIT})"
+          echo "Wanted GUI:       ${GUI_TAG} (${GUI_COMMIT})"
+          echo "Current redumper: ${CURRENT_REDUMPER_TAG} (${CURRENT_REDUMPER_COMMIT})"
+          echo "Wanted redumper:  ${REDUMPER_TAG} (${REDUMPER_COMMIT})"
+
+          NEEDS_UPDATE=false
+
+          if [[ "${CURRENT_GUI_TAG}" != "${GUI_TAG}" ]]; then
+            NEEDS_UPDATE=true
+          fi
+
+          if [[ "${CURRENT_GUI_COMMIT}" != "${GUI_COMMIT}" ]]; then
+            NEEDS_UPDATE=true
+          fi
+
+          if [[ "${CURRENT_REDUMPER_TAG}" != "${REDUMPER_TAG}" ]]; then
+            NEEDS_UPDATE=true
+          fi
+
+          if [[ "${CURRENT_REDUMPER_COMMIT}" != "${REDUMPER_COMMIT}" ]]; then
+            NEEDS_UPDATE=true
+          fi
+
+          if [[ "${CURRENT_REDUMPER_BUILD_VERSION}" != "${REDUMPER_TAG}" ]]; then
+            NEEDS_UPDATE=true
+          fi
+
+          echo "update=${NEEDS_UPDATE}" >> "${GITHUB_OUTPUT}"
+          echo "gui_tag=${GUI_TAG}" >> "${GITHUB_OUTPUT}"
+          echo "gui_version=${GUI_VERSION}" >> "${GITHUB_OUTPUT}"
+          echo "gui_commit=${GUI_COMMIT}" >> "${GITHUB_OUTPUT}"
+          echo "gui_date=${GUI_RELEASE_DATE}" >> "${GITHUB_OUTPUT}"
+          echo "redumper_tag=${REDUMPER_TAG}" >> "${GITHUB_OUTPUT}"
+          echo "redumper_commit=${REDUMPER_COMMIT}" >> "${GITHUB_OUTPUT}"
+
+          if [[ "${NEEDS_UPDATE}" == "true" ]]; then
+            gh api \
+              "repos/${GUI_REPO}/contents/Cargo.lock?ref=${GUI_TAG}" \
+              --jq '.content' |
+              base64 --decode \
+              > /tmp/Cargo.lock
+          else
+            echo "Already up to date."
+          fi
+
+      - name: Regenerate Cargo sources
+        if: steps.versions.outputs.update == 'true'
+        run: |
+          set -euo pipefail
+
+          python3 -m venv /tmp/flatpak-cargo-generator
+
+          /tmp/flatpak-cargo-generator/bin/pip \
+            install \
+            --disable-pip-version-check \
+            aiohttp \
+            tomlkit
+
+          curl \
+            --fail \
+            --location \
+            --silent \
+            --show-error \
+            "https://raw.githubusercontent.com/flatpak/flatpak-builder-tools/${CARGO_GENERATOR_COMMIT}/cargo/flatpak-cargo-generator.py" \
+            -o /tmp/flatpak-cargo-generator.py
+
+          /tmp/flatpak-cargo-generator/bin/python \
+            /tmp/flatpak-cargo-generator.py \
+            /tmp/Cargo.lock \
+            -o cargo-sources.json
+
+      - name: Update manifest and MetaInfo
+        if: steps.versions.outputs.update == 'true'
+        env:
+          GUI_TAG: ${{ steps.versions.outputs.gui_tag }}
+          GUI_VERSION: ${{ steps.versions.outputs.gui_version }}
+          GUI_COMMIT: ${{ steps.versions.outputs.gui_commit }}
+          GUI_DATE: ${{ steps.versions.outputs.gui_date }}
+          REDUMPER_TAG: ${{ steps.versions.outputs.redumper_tag }}
+          REDUMPER_COMMIT: ${{ steps.versions.outputs.redumper_commit }}
+        run: |
+          set -euo pipefail
+
+          python3 <<'PY'
+          import os
+          from pathlib import Path
+
+          manifest_path = Path(os.environ["MANIFEST"])
+          metainfo_path = Path(os.environ["METAINFO"])
+
+          gui_url = os.environ["GUI_GIT"]
+          redumper_url = os.environ["REDUMPER_GIT"]
+
+          gui_tag = os.environ["GUI_TAG"]
+          gui_commit = os.environ["GUI_COMMIT"]
+          gui_version = os.environ["GUI_VERSION"]
+          gui_date = os.environ["GUI_DATE"]
+
+          redumper_tag = os.environ["REDUMPER_TAG"]
+          redumper_commit = os.environ["REDUMPER_COMMIT"]
+
+
+          def replace_source(lines, url, tag, commit):
+              inside_source = False
+
+              for index, line in enumerate(lines):
+                  stripped = line.strip()
+
+                  if stripped == f"url: {url}":
+                      inside_source = True
+                      continue
+
+                  if inside_source and stripped.startswith("tag:"):
+                      indent = line[: len(line) - len(line.lstrip())]
+                      lines[index] = f"{indent}tag: {tag}\n"
+                      continue
+
+                  if inside_source and stripped.startswith("commit:"):
+                      indent = line[: len(line) - len(line.lstrip())]
+                      lines[index] = f"{indent}commit: {commit}\n"
+                      return
+
+              raise RuntimeError(f"Could not update source {url}")
+
+
+          lines = manifest_path.read_text(encoding="utf-8").splitlines(
+              keepends=True
+          )
+
+          replace_source(
+              lines,
+              redumper_url,
+              redumper_tag,
+              redumper_commit,
+          )
+
+          replace_source(
+              lines,
+              gui_url,
+              gui_tag,
+              gui_commit,
+          )
+
+          found_build_version = False
+
+          for index, line in enumerate(lines):
+              if "-DREDUMPER_VERSION_BUILD=" in line:
+                  indent = line[: len(line) - len(line.lstrip())]
+                  lines[index] = (
+                      f"{indent}- -DREDUMPER_VERSION_BUILD="
+                      f"{redumper_tag}\n"
+                  )
+                  found_build_version = True
+                  break
+
+          if not found_build_version:
+              raise RuntimeError(
+                  "Could not find DREDUMPER_VERSION_BUILD"
+              )
+
+          manifest_path.write_text(
+              "".join(lines),
+              encoding="utf-8",
+          )
+
+          metainfo = metainfo_path.read_text(encoding="utf-8")
+
+          release_marker = f'<release version="{gui_version}"'
+
+          if release_marker not in metainfo:
+              releases_tag = "  <releases>\n"
+
+              new_release = (
+                  f'    <release version="{gui_version}" '
+                  f'date="{gui_date}"/>\n'
+              )
+
+              if releases_tag not in metainfo:
+                  raise RuntimeError(
+                      "Could not find <releases> in MetaInfo"
+                  )
+
+              metainfo = metainfo.replace(
+                  releases_tag,
+                  releases_tag + new_release,
+                  1,
+              )
+
+              metainfo_path.write_text(
+                  metainfo,
+                  encoding="utf-8",
+              )
+          PY
+
+      - name: Show changes
+        if: steps.versions.outputs.update == 'true'
+        run: |
+          git diff -- \
+            "${MANIFEST}" \
+            "${METAINFO}" \
+            cargo-sources.json
+
+      - name: Create update pull request
+        if: steps.versions.outputs.update == 'true'
+        uses: peter-evans/create-pull-request@271a8d0340265f705b14b6d32b9829c1cb33d45e
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+          branch: automation/update-redumper-gui
+          delete-branch: true
+
+          add-paths: |
+            io.github.deterous.redumper-gui.yml
+            io.github.deterous.redumper-gui.metainfo.xml
+            cargo-sources.json
+
+          commit-message: >-
+            Update Redumper GUI to ${{ steps.versions.outputs.gui_tag }}
+
+          title: >-
+            Update Redumper GUI to ${{ steps.versions.outputs.gui_tag }}
+
+          body: |
+            Updates Redumper GUI to `${{ steps.versions.outputs.gui_tag }}`.
+
+            Uses the Redumper version explicitly pinned by that upstream
+            Redumper GUI release:
+
+            `${{ steps.versions.outputs.redumper_tag }}`
+
+            This also regenerates `cargo-sources.json` from the upstream
+            release's `Cargo.lock` and updates the MetaInfo release entry.
+
+            This PR should be built and tested before merging.
+
+          committer: >-
+            github-actions[bot]
+            <41898282+github-actions[bot]@users.noreply.github.com>
+
+          author: >-
+            github-actions[bot]
+            <41898282+github-actions[bot]@users.noreply.github.com>
