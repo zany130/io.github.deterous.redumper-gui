@@ -26,7 +26,7 @@ modules:
       - -DCMAKE_BUILD_TYPE=Release
       - -DCMAKE_C_COMPILER=clang
       - -DCMAKE_CXX_COMPILER=clang++
-      - -DREDUMPER_VERSION_BUILD=b750
+      - -DREDUMPER_VERSION_BUILD=b769
       # The upstream Linux toolchain links with -static. The SDK has no
       # static libc, so link the runtime instead.
       - "-DREDUMPER_LINKER_FLAGS:STRING="
@@ -35,8 +35,8 @@ modules:
     sources:
       - type: git
         url: https://github.com/superg/redumper.git
-        tag: b750
-        commit: 1704af30f951c77ff05e739cfa6d7027e66b2507
+        tag: b769
+        commit: 7cbe3a27a167972ac959c1232dc0f3d605b749ba
       - type: git
         url: https://github.com/google/googletest.git
         tag: v1.15.2
@@ -60,8 +60,8 @@ modules:
     sources:   
       - type: git
         url: https://github.com/Deterous/Redumper-GUI.git
-        tag: v1.0.6
-        commit: 63144b13e6306043d30b16c5d16e9f0d63afe5ff
+        tag: v1.1.1
+        commit: 65028e722f56d0743a68ba8782b6e8ed0bcaef4f
       - cargo-sources.json
       - type: file
         path: io.github.deterous.redumper-gui.desktop
